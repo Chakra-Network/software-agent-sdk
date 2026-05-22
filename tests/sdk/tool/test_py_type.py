@@ -246,3 +246,99 @@ class TestPyTypeEdgeCases:
 
         # Assert
         assert result == list[Any]
+
+
+class TestPyTypeRefResolution:
+    """Test py_type with $ref / $defs resolution."""
+
+    def test_ref_to_scalar_def_is_resolved(self):
+        """A $ref to a scalar def resolves to that scalar type."""
+        defs = {"MyStr": {"type": "string"}}
+        spec = {"$ref": "#/$defs/MyStr"}
+
+        result = py_type(spec, defs)
+
+        assert result is str
+
+    def test_array_of_ref_items_resolves_inner_type(self):
+        """list[ref → string] becomes list[str]."""
+        defs = {"MyStr": {"type": "string"}}
+        spec = {"type": "array", "items": {"$ref": "#/$defs/MyStr"}}
+
+        result = py_type(spec, defs)
+
+        assert result == list[str]
+
+    def test_ref_to_object_with_properties_builds_nested_model(self):
+        """A $ref to an object def builds a Pydantic model with the props."""
+        defs = {
+            "Block": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["a", "b"]},
+                    "n": {"type": "integer"},
+                },
+                "required": ["kind"],
+            }
+        }
+        spec = {"type": "array", "items": {"$ref": "#/$defs/Block"}}
+
+        result = py_type(spec, defs)
+
+        # list[<NestedModel>]
+        assert getattr(result, "__origin__", None) is list
+        (inner,) = result.__args__
+        # The inner type is a Pydantic BaseModel with both fields.
+        json_schema = inner.model_json_schema()
+        assert "kind" in json_schema["properties"]
+        assert "n" in json_schema["properties"]
+        assert json_schema["properties"]["kind"]["enum"] == ["a", "b"]
+        assert json_schema["required"] == ["kind"]
+
+    def test_self_referential_ref_falls_back_to_dict(self):
+        """A self-referential $ref cycle falls back to dict[str, Any]."""
+        # Block.children → list[Block] (recursive)
+        defs = {
+            "Block": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string"},
+                    "children": {
+                        "type": "array",
+                        "items": {"$ref": "#/$defs/Block"},
+                    },
+                },
+            }
+        }
+        spec = {"$ref": "#/$defs/Block"}
+
+        result = py_type(spec, defs)
+
+        # Outer is a Pydantic model — accessing model_json_schema below should
+        # not RecursionError on the self-referential children field.
+        json_schema = result.model_json_schema()
+        # children is optional → Pydantic represents it as anyOf[array, null].
+        children_schema = json_schema["properties"]["children"]
+        if "anyOf" in children_schema:
+            array_variant = next(
+                v for v in children_schema["anyOf"] if v.get("type") == "array"
+            )
+        else:
+            array_variant = children_schema
+        assert array_variant["type"] == "array"
+
+    def test_missing_def_for_ref_returns_any(self):
+        """A $ref pointing to a missing def falls through to Any."""
+        # No defs supplied → ref can't be resolved → behaves like an empty spec.
+        spec = {"$ref": "#/$defs/MissingDef"}
+
+        result = py_type(spec, {})
+
+        assert result is Any
+
+    def test_backward_compatible_single_arg(self):
+        """Existing single-arg callers continue to work."""
+        spec = {"type": "string"}
+        # Same as test_string_type but explicitly asserting no positional
+        # break for downstream callers.
+        assert py_type(spec) is str

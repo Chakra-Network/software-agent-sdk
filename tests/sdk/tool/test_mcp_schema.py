@@ -385,4 +385,112 @@ class TestCircularSchemaHandling:
         assert "next" in result["properties"]
         assert result["properties"]["next"]["type"] == "object"
 
-        json.dumps(result)
+
+def test_from_mcp_schema_preserves_object_inside_array_via_ref():
+    """When MCP schema uses $defs + $ref for array items, the resulting
+    Pydantic model must preserve the item structure end-to-end, not collapse
+    it to `Any`.
+
+    Regression for the OpenHands SDK not resolving $ref in incoming MCP
+    inputSchema — repro shape mirrors the Notion `notion-create-pages` tool.
+    """
+    schema = {
+        "type": "object",
+        "$defs": {
+            "Block": {
+                "type": "object",
+                "required": ["type", "content"],
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["paragraph", "heading1", "callout"],
+                    },
+                    "content": {"type": "string"},
+                    "children": {
+                        "type": "array",
+                        "items": {"$ref": "#/$defs/Block"},
+                    },
+                },
+            }
+        },
+        "properties": {
+            "initialTitle": {"type": "string"},
+            "initialBlocks": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/Block"},
+            },
+        },
+        "required": ["initialTitle", "initialBlocks"],
+    }
+
+    Model = Schema.from_mcp_schema("NotionCreatePagesAction", schema)
+    json_schema = Model.model_json_schema()
+
+    # initialBlocks must be an array whose items are typed objects (NOT empty).
+    items = json_schema["properties"]["initialBlocks"]["items"]
+    # Pydantic emits a $ref to the nested model definition; resolve it.
+    if "$ref" in items:
+        ref_name = items["$ref"].split("/")[-1]
+        items = json_schema["$defs"][ref_name]
+
+    assert items.get("type") == "object", (
+        f"initialBlocks items should be 'object', got: {items}"
+    )
+    assert "type" in items["properties"]
+    assert items["properties"]["type"].get("enum") == [
+        "paragraph",
+        "heading1",
+        "callout",
+    ]
+    assert "content" in items["properties"]
+    assert set(items.get("required", [])) >= {"type", "content"}
+
+
+def test_from_mcp_schema_handles_self_referential_cycle():
+    """A self-referential schema must not RecursionError. Cycle nodes fall
+    back to dict[str, Any] (rendered as a featureless object by Pydantic)
+    while the outer structure is preserved."""
+    schema = {
+        "type": "object",
+        "$defs": {
+            "Block": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string"},
+                    "children": {
+                        "type": "array",
+                        "items": {"$ref": "#/$defs/Block"},
+                    },
+                },
+            }
+        },
+        "properties": {
+            "block": {"$ref": "#/$defs/Block"},
+        },
+        "required": ["block"],
+    }
+
+    Model = Schema.from_mcp_schema("RecursiveBlockAction", schema)
+    json_schema = Model.model_json_schema()
+
+    # Should not have raised; outer block field must be present.
+    assert "block" in json_schema["properties"]
+
+
+def test_from_mcp_schema_no_defs_backward_compatible():
+    """Schemas without $defs / $ref behave exactly as before."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "Cmd"},
+            "count": {"type": "integer"},
+        },
+        "required": ["command", "count"],
+    }
+
+    Model = Schema.from_mcp_schema("PlainAction", schema)
+    json_schema = Model.model_json_schema()
+
+    assert json_schema["properties"]["command"]["type"] == "string"
+    assert json_schema["properties"]["count"]["type"] == "integer"
+    assert set(json_schema["required"]) == {"command", "count"}

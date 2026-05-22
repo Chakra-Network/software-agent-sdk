@@ -1,8 +1,9 @@
+import json
 from abc import ABC
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 
-from pydantic import ConfigDict, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 from rich.text import Text
 
 from openhands.sdk.llm import ImageContent, TextContent
@@ -22,8 +23,34 @@ logger = get_logger(__name__)
 S = TypeVar("S", bound="Schema")
 
 
-def py_type(spec: dict[str, Any]) -> Any:
-    """Map JSON schema types to Python types."""
+def py_type(
+    spec: dict[str, Any],
+    defs: dict[str, Any] | None = None,
+    _visiting: frozenset[str] | None = None,
+) -> Any:
+    """Map JSON schema types to Python types.
+
+    When ``defs`` is provided, ``$ref`` entries pointing into ``#/$defs/...``
+    are resolved (with cycle detection) so recursive MCP schemas survive the
+    round-trip. Without it, behavior matches the original single-arg form.
+    """
+    defs = defs or {}
+    _visiting = _visiting or frozenset()
+
+    # Resolve $ref through $defs with cycle detection. Mirrors the outbound
+    # _process_schema_node so the inbound path no longer drops recursive
+    # structure (e.g. Notion's blockSchema) to `Any`.
+    if "$ref" in spec:
+        ref_path = spec["$ref"]
+        if ref_path.startswith("#/$defs/"):
+            ref_name = ref_path.split("/")[-1]
+            if ref_name in defs:
+                if ref_name in _visiting:
+                    # Cycle: fall back to dict[str, Any] rather than Any so
+                    # the LLM-facing schema still says "items are objects".
+                    return dict[str, Any]
+                return py_type(defs[ref_name], defs, _visiting | {ref_name})
+
     t = spec.get("type")
 
     # Normalize union types like ["string", "null"] to a single representative type.
@@ -37,10 +64,25 @@ def py_type(spec: dict[str, Any]) -> Any:
             return Any
     if t == "array":
         items = spec.get("items", {})
-        inner = py_type(items) if isinstance(items, dict) else Any
+        inner = py_type(items, defs, _visiting) if isinstance(items, dict) else Any
         return list[inner]  # type: ignore[index]
     if t == "object":
+        # If the object schema has properties, build a nested Pydantic model
+        # so the downstream JSON Schema for the LLM preserves the structure
+        # (enum values, required fields, descriptions) instead of collapsing
+        # to a featureless `{"type": "object"}`.
+        if "properties" in spec:
+            return _build_object_model(spec, defs, _visiting)
         return dict[str, Any]
+    # Preserve enum constraints so the LLM still sees the allowed values.
+    # Works for any JSON Schema scalar type (typically string, integer).
+    enum_values = spec.get("enum")
+    if isinstance(enum_values, list) and enum_values:
+        try:
+            return Literal[tuple(enum_values)]  # type: ignore[valid-type]
+        except TypeError:
+            # Fall through if enum values aren't hashable.
+            pass
     _map = {
         "string": str,
         "integer": int,
@@ -50,6 +92,54 @@ def py_type(spec: dict[str, Any]) -> Any:
     if t in _map:
         return _map[t]
     return Any
+
+
+def _build_object_model(
+    spec: dict[str, Any],
+    defs: dict[str, Any],
+    _visiting: frozenset[str],
+) -> type[BaseModel]:
+    """Build a Pydantic BaseModel for a nested object JSON Schema.
+
+    Used by ``py_type`` to preserve nested object structure (typed fields,
+    required list, enums on fields) inside arrays and other containers.
+    The top-level model is still built via ``Schema.from_mcp_schema``.
+    """
+    # Deterministic, content-addressed name so repeated invocations on the
+    # same shape return the same class identity (helps caching downstream).
+    digest = abs(hash(json.dumps(spec, sort_keys=True, default=str)))
+    name = f"MCPNested_{digest:x}"
+
+    props: dict[str, Any] = spec.get("properties", {}) or {}
+    required = set(spec.get("required", []) or [])
+
+    fields: dict[str, tuple] = {}
+    for fname, fspec in props.items():
+        fspec = fspec if isinstance(fspec, dict) else {}
+        tp = py_type(fspec, defs, _visiting)
+        desc: str | None = fspec.get("description")
+        if fname in required:
+            anno, default = tp, ...
+        else:
+            anno, default = (tp | None), None
+        fields[fname] = (
+            anno,
+            Field(default=default, description=desc)
+            if desc
+            else Field(default=default),
+        )
+
+    # Build a base class carrying model_config; create_model rejects
+    # `model_config` as a kwarg (it would be interpreted as a field name).
+    forbid_extra = spec.get("additionalProperties") is False
+
+    class _NestedBase(BaseModel):
+        model_config = ConfigDict(
+            extra="forbid" if forbid_extra else "allow",
+            frozen=True,
+        )
+
+    return create_model(name, __base__=_NestedBase, **fields)
 
 
 def _shallow_expand_circular_ref(ref_def: dict[str, Any]) -> dict[str, Any]:
@@ -209,13 +299,17 @@ class Schema(DiscriminatedUnionMixin):
         assert isinstance(schema, dict), "Schema must be a dict"
         assert schema.get("type") == "object", "Only object schemas are supported"
 
+        # Read $defs so $ref entries inside properties can be resolved.
+        # Without this, recursive MCP schemas (e.g. Notion blockSchema) collapse
+        # to `Any` and the LLM-facing tool definition loses items/structure.
+        defs: dict[str, Any] = schema.get("$defs", {}) or {}
         props: dict[str, Any] = schema.get("properties", {}) or {}
         required = set(schema.get("required", []) or [])
 
         fields: dict[str, tuple] = {}
         for fname, spec in props.items():
             spec = spec if isinstance(spec, dict) else {}
-            tp = py_type(spec)
+            tp = py_type(spec, defs)
 
             # Add description if present
             desc: str | None = spec.get("description")
