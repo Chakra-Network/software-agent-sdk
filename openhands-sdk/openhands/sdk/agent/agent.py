@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import httpx
 from pydantic import PrivateAttr, ValidationError, model_validator
 
 import openhands.sdk.security.analyzer as analyzer
@@ -87,6 +89,14 @@ from openhands.sdk.tool.builtins import (
 
 
 logger = get_logger(__name__)
+
+# Dojo fake-time integration: when the dojo time-server publishes DOJO_TIMESERVER_URL
+# (only while faking), advance its clock by one step after each completion round.
+_DOJO_TIMESERVER_URL_ENV = "DOJO_TIMESERVER_URL"
+_DOJO_ADVANCE_DELTA_MS_ENV = "DOJO_TIMESERVER_ADVANCE_DELTA_MS"
+_DOJO_ADVANCE_DELTA_MS_DEFAULT = "1000"
+_DOJO_ADVANCE_PATH = "/advance"
+_DOJO_ADVANCE_TIMEOUT_SEC = 2.0
 maybe_init_laminar()
 
 
@@ -507,8 +517,8 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         batch.emit(on_event)
         batch.finalize(
             on_event=on_event,
-            check_iterative_refinement=lambda ae: (
-                self._check_iterative_refinement(conversation, ae)
+            check_iterative_refinement=lambda ae: self._check_iterative_refinement(
+                conversation, ae
             ),
             mark_finished=lambda: setattr(
                 state,
@@ -541,8 +551,8 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         batch.emit(on_event)
         batch.finalize(
             on_event=on_event,
-            check_iterative_refinement=lambda ae: (
-                self._check_iterative_refinement(conversation, ae)
+            check_iterative_refinement=lambda ae: self._check_iterative_refinement(
+                conversation, ae
             ),
             mark_finished=lambda: setattr(
                 state,
@@ -680,6 +690,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                     on_event,
                     response_type=response_type,
                 )
+        self._advance_dojo_clock()
 
     async def astep(
         self,
@@ -816,6 +827,47 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                     on_event,
                     response_type=response_type,
                 )
+        await self._aadvance_dojo_clock()
+
+    def _advance_dojo_clock(self) -> None:
+        """Advance the dojo time-server clock by one configured step.
+
+        No-op unless dojo fake-time is active (``DOJO_TIMESERVER_URL`` set, which
+        the time-server publishes only while faking). Called once per completion
+        round, after the round's events — and their recorded timestamps — exist, so
+        the round keeps its pre-advance time and the clock moves on for the next
+        round. Best-effort: a time-server hiccup must not abort the agent run.
+        """
+        url = os.environ.get(_DOJO_TIMESERVER_URL_ENV)
+        if not url:
+            return
+        delta_ms = int(
+            os.environ.get(_DOJO_ADVANCE_DELTA_MS_ENV, _DOJO_ADVANCE_DELTA_MS_DEFAULT)
+        )
+        try:
+            httpx.post(
+                f"{url}{_DOJO_ADVANCE_PATH}",
+                json={"deltaMs": delta_ms},
+                timeout=_DOJO_ADVANCE_TIMEOUT_SEC,
+            )
+        except Exception as e:
+            logger.warning(f"dojo time-server {_DOJO_ADVANCE_PATH} failed: {e}")
+
+    async def _aadvance_dojo_clock(self) -> None:
+        """Async variant of :meth:`_advance_dojo_clock`."""
+        url = os.environ.get(_DOJO_TIMESERVER_URL_ENV)
+        if not url:
+            return
+        delta_ms = int(
+            os.environ.get(_DOJO_ADVANCE_DELTA_MS_ENV, _DOJO_ADVANCE_DELTA_MS_DEFAULT)
+        )
+        try:
+            async with httpx.AsyncClient(timeout=_DOJO_ADVANCE_TIMEOUT_SEC) as client:
+                await client.post(
+                    f"{url}{_DOJO_ADVANCE_PATH}", json={"deltaMs": delta_ms}
+                )
+        except Exception as e:
+            logger.warning(f"dojo time-server {_DOJO_ADVANCE_PATH} failed: {e}")
 
     def _requires_user_confirmation(
         self, state: ConversationState, action_events: list[ActionEvent]
