@@ -123,6 +123,15 @@ def test_advance_clock_honors_custom_delta():
             assert mock_post.call_args.kwargs["json"] == {"deltaMs": 5000}
 
 
+def test_advance_clock_skips_when_delta_zero():
+    """A delta of 0 freezes the clock: no /advance call (and no URL needed)."""
+    env = {dojo_time._ENABLED_ENV: "1", dojo_time._ADVANCE_DELTA_MS_ENV: "0"}
+    with patch.dict("os.environ", env, clear=True):
+        with patch.object(dojo_time.httpx, "post") as mock_post:
+            dojo_time.advance_clock()
+            mock_post.assert_not_called()
+
+
 def test_advance_clock_raises_on_error_status():
     resp = MagicMock()
     resp.raise_for_status.side_effect = RuntimeError("bad status")

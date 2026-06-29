@@ -75,20 +75,32 @@ def now_isoformat() -> str:
     return (fake_now() or datetime.now()).isoformat()
 
 
+def _advance_request() -> tuple[str, int] | None:
+    """The ``(url, deltaMs)`` for a ``POST /advance``, or None when there's
+    nothing to do — fake-time inactive, or a delta of 0 (clock frozen)."""
+    if not _enabled():
+        return None
+    delta_ms = _advance_delta_ms()
+    if delta_ms == 0:
+        return None
+    return _timeserver_url(), delta_ms
+
+
 def advance_clock() -> None:
     """Advance the dojo time-server clock by one configured step.
 
-    No-op unless dojo fake-time is active. Called once per completion round,
-    after the round's events — and their recorded timestamps — exist, so the
-    round keeps its pre-advance time and the clock moves on for the next round.
-    Raises if the advance fails.
+    No-op unless dojo fake-time is active and the delta is non-zero. Called once
+    per completion round, after the round's events — and their recorded
+    timestamps — exist, so the round keeps its pre-advance time and the clock
+    moves on for the next round. Raises if the advance fails.
     """
-    if not _enabled():
+    req = _advance_request()
+    if req is None:
         return
-    url = _timeserver_url()
+    url, delta_ms = req
     resp = httpx.post(
         f"{url}{_ADVANCE_PATH}",
-        json={"deltaMs": _advance_delta_ms()},
+        json={"deltaMs": delta_ms},
         timeout=_TIMESERVER_TIMEOUT_SEC,
     )
     resp.raise_for_status()
@@ -96,11 +108,10 @@ def advance_clock() -> None:
 
 async def aadvance_clock() -> None:
     """Async variant of :func:`advance_clock`."""
-    if not _enabled():
+    req = _advance_request()
+    if req is None:
         return
-    url = _timeserver_url()
+    url, delta_ms = req
     async with httpx.AsyncClient(timeout=_TIMESERVER_TIMEOUT_SEC) as client:
-        resp = await client.post(
-            f"{url}{_ADVANCE_PATH}", json={"deltaMs": _advance_delta_ms()}
-        )
+        resp = await client.post(f"{url}{_ADVANCE_PATH}", json={"deltaMs": delta_ms})
     resp.raise_for_status()
