@@ -1,18 +1,10 @@
 """Dojo fake-time integration: read and advance the dojo time-server clock.
 
-The dojo time-server is a *stopped* clock — it only moves when something POSTs
-``/advance`` (the agent does this once per completion round). Between advances,
-``GET /state`` returns a constant instant. The integration is active only when
-the time-server publishes ``DOJO_TIMESERVER_URL`` into the environment (it does
-so only while faking); absent, every function here is a no-op and callers fall
-back to the real wall clock.
-
-This is the explicit-read replacement for the old libfaketime/``LD_PRELOAD``
-approach. Preloading libfaketime faked the clock process-wide — including inside
-OpenSSL's certificate-validity check — so a real outbound TLS handshake to the
-LLM endpoint saw a clock in the past and rejected the (not-yet-valid) cert.
-Reading the fake clock explicitly, only where we stamp trajectory events, keeps
-the process on the real clock for everything else (TLS, timeouts, logging).
+The time-server is a *stopped* clock — it only moves on ``POST /advance`` (the
+agent does this once per completion round); ``GET /state`` returns the current
+instant. Active only when ``DOJO_FAKETIME_ENABLED`` is set (the time-server's
+feature flag); otherwise every function here is a no-op and callers fall back to
+the real wall clock.
 """
 
 from __future__ import annotations
@@ -27,6 +19,7 @@ from openhands.sdk.logger import get_logger
 
 logger = get_logger(__name__)
 
+_ENABLED_ENV = "DOJO_FAKETIME_ENABLED"
 _TIMESERVER_URL_ENV = "DOJO_TIMESERVER_URL"
 _ADVANCE_DELTA_MS_ENV = "DOJO_TIMESERVER_ADVANCE_DELTA_MS"
 _ADVANCE_DELTA_MS_DEFAULT = 1000
@@ -36,7 +29,13 @@ _TIMESERVER_TIMEOUT_SEC = 2.0
 
 
 def _timeserver_url() -> str | None:
-    """The dojo time-server base URL, or None when fake-time is inactive."""
+    """The time-server base URL when fake-time is enabled, else None.
+
+    Gated on the ``DOJO_FAKETIME_ENABLED`` feature flag; the URL comes from
+    ``DOJO_TIMESERVER_URL``.
+    """
+    if _ENABLED_ENV not in os.environ:
+        return None
     return os.environ.get(_TIMESERVER_URL_ENV) or None
 
 
@@ -57,14 +56,10 @@ def _advance_delta_ms() -> int:
 def fake_now() -> datetime | None:
     """The time-server's simulated clock, or None when inactive/unreachable.
 
-    Reads ``GET /state`` live on every call (no caching) so the stamped time is
-    exact — the clock can move (``/advance``) between any two calls. Best-effort:
-    any failure returns None so callers fall back to the real clock rather than
-    aborting the work that needed a timestamp.
-
-    The returned naive datetime matches the previous ``datetime.now()``
-    (libfaketime) behavior, so trajectory timestamps keep their existing format
-    with no timezone suffix.
+    Read live on every call (no caching) so the stamp is exact — the clock can
+    move between calls. Best-effort: any failure returns None so callers fall back
+    to the real clock. Returns a naive datetime to match ``datetime.now()``'s
+    format (no timezone suffix).
     """
     url = _timeserver_url()
     if not url:
