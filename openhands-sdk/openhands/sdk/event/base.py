@@ -1,6 +1,5 @@
 import uuid
 from abc import ABC, abstractmethod
-from datetime import datetime
 from typing import TYPE_CHECKING, ClassVar
 
 from pydantic import ConfigDict, Field
@@ -8,6 +7,7 @@ from rich.text import Text
 
 from openhands.sdk.event.types import EventID, SourceType
 from openhands.sdk.llm import ImageContent, Message, TextContent
+from openhands.sdk.utils import dojo_time
 from openhands.sdk.utils.models import DiscriminatedUnionMixin
 
 
@@ -26,9 +26,9 @@ class Event(DiscriminatedUnionMixin, ABC):
         description="Unique event id (ULID/UUID)",
     )
     timestamp: str = Field(
-        default_factory=lambda: datetime.now().isoformat(),
+        default_factory=dojo_time.now_isoformat,
         description="Event timestamp",
-    )  # consistent with V1
+    )  # consistent with V1; tracks the dojo fake clock when active
     source: SourceType = Field(..., description="The source of this event")
 
     @property

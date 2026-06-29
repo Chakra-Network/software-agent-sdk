@@ -74,6 +74,7 @@ from openhands.sdk.tool import (
     Action,
     Observation,
 )
+from openhands.sdk.utils import dojo_time
 
 
 if TYPE_CHECKING:
@@ -507,8 +508,8 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         batch.emit(on_event)
         batch.finalize(
             on_event=on_event,
-            check_iterative_refinement=lambda ae: (
-                self._check_iterative_refinement(conversation, ae)
+            check_iterative_refinement=lambda ae: self._check_iterative_refinement(
+                conversation, ae
             ),
             mark_finished=lambda: setattr(
                 state,
@@ -541,8 +542,8 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         batch.emit(on_event)
         batch.finalize(
             on_event=on_event,
-            check_iterative_refinement=lambda ae: (
-                self._check_iterative_refinement(conversation, ae)
+            check_iterative_refinement=lambda ae: self._check_iterative_refinement(
+                conversation, ae
             ),
             mark_finished=lambda: setattr(
                 state,
@@ -680,6 +681,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                     on_event,
                     response_type=response_type,
                 )
+        dojo_time.advance_clock()
 
     async def astep(
         self,
@@ -816,6 +818,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                     on_event,
                     response_type=response_type,
                 )
+        await dojo_time.aadvance_clock()
 
     def _requires_user_confirmation(
         self, state: ConversationState, action_events: list[ActionEvent]
