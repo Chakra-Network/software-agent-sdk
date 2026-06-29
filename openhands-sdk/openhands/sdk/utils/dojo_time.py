@@ -5,6 +5,10 @@ agent does this once per completion round); ``GET /state`` returns the current
 instant. Active only when ``DOJO_FAKETIME_ENABLED`` is set (the time-server's
 feature flag); otherwise every function here is a no-op and callers fall back to
 the real wall clock.
+
+When fake-time *is* active, failures raise rather than fall back: a broken
+time-server must surface loudly, not silently stamp real-clock times into the
+trajectory.
 """
 
 from __future__ import annotations
@@ -14,10 +18,6 @@ from datetime import datetime
 
 import httpx
 
-from openhands.sdk.logger import get_logger
-
-
-logger = get_logger(__name__)
 
 _ENABLED_ENV = "DOJO_FAKETIME_ENABLED"
 _TIMESERVER_URL_ENV = "DOJO_TIMESERVER_URL"
@@ -28,52 +28,45 @@ _ADVANCE_PATH = "/advance"
 _TIMESERVER_TIMEOUT_SEC = 2.0
 
 
-def _timeserver_url() -> str | None:
-    """The time-server base URL when fake-time is enabled, else None.
+def _enabled() -> bool:
+    """Whether dojo fake-time is active (the ``DOJO_FAKETIME_ENABLED`` flag)."""
+    return _ENABLED_ENV in os.environ
 
-    Gated on the ``DOJO_FAKETIME_ENABLED`` feature flag; the URL comes from
-    ``DOJO_TIMESERVER_URL``.
+
+def _timeserver_url() -> str:
+    """The time-server base URL. Call only when :func:`_enabled`.
+
+    Raises if the flag is set without a URL — a misconfiguration we surface
+    rather than silently disabling fake-time.
     """
-    if _ENABLED_ENV not in os.environ:
-        return None
-    return os.environ.get(_TIMESERVER_URL_ENV) or None
+    url = os.environ.get(_TIMESERVER_URL_ENV)
+    if not url:
+        raise RuntimeError(f"{_ENABLED_ENV} is set but {_TIMESERVER_URL_ENV} is empty")
+    return url
 
 
 def _advance_delta_ms() -> int:
     raw = os.environ.get(_ADVANCE_DELTA_MS_ENV)
     if not raw:
         return _ADVANCE_DELTA_MS_DEFAULT
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning(
-            f"invalid {_ADVANCE_DELTA_MS_ENV}={raw!r}; "
-            f"using {_ADVANCE_DELTA_MS_DEFAULT}"
-        )
-        return _ADVANCE_DELTA_MS_DEFAULT
+    return int(raw)  # raises ValueError on a malformed value — fail fast
 
 
 def fake_now() -> datetime | None:
-    """The time-server's simulated clock, or None when inactive/unreachable.
+    """The time-server's simulated clock, or None when fake-time is inactive.
 
     Read live on every call (no caching) so the stamp is exact — the clock can
-    move between calls. Best-effort: any failure returns None so callers fall back
-    to the real clock. Returns a naive datetime to match ``datetime.now()``'s
-    format (no timezone suffix).
+    move between calls. Raises on any failure while active. Returns a naive
+    datetime to match ``datetime.now()``'s format (no timezone suffix).
     """
+    if not _enabled():
+        return None
     url = _timeserver_url()
-    if not url:
-        return None
-    try:
-        resp = httpx.get(f"{url}{_STATE_PATH}", timeout=_TIMESERVER_TIMEOUT_SEC)
-        resp.raise_for_status()
-        now_ms = resp.json().get("nowMs")
-    except Exception as e:
-        logger.warning(f"dojo time-server {_STATE_PATH} failed: {e}")
-        return None
+    resp = httpx.get(f"{url}{_STATE_PATH}", timeout=_TIMESERVER_TIMEOUT_SEC)
+    resp.raise_for_status()
+    now_ms = resp.json()["nowMs"]
     if not isinstance(now_ms, (int, float)) or now_ms <= 0:
-        logger.warning(f"dojo time-server {_STATE_PATH} returned nowMs={now_ms!r}")
-        return None
+        raise ValueError(f"dojo time-server {_STATE_PATH} returned nowMs={now_ms!r}")
     return datetime.fromtimestamp(now_ms / 1000)
 
 
@@ -88,30 +81,26 @@ def advance_clock() -> None:
     No-op unless dojo fake-time is active. Called once per completion round,
     after the round's events — and their recorded timestamps — exist, so the
     round keeps its pre-advance time and the clock moves on for the next round.
-    Best-effort: a time-server hiccup must not abort the agent run.
+    Raises if the advance fails.
     """
-    url = _timeserver_url()
-    if not url:
+    if not _enabled():
         return
-    try:
-        httpx.post(
-            f"{url}{_ADVANCE_PATH}",
-            json={"deltaMs": _advance_delta_ms()},
-            timeout=_TIMESERVER_TIMEOUT_SEC,
-        )
-    except Exception as e:
-        logger.warning(f"dojo time-server {_ADVANCE_PATH} failed: {e}")
+    url = _timeserver_url()
+    resp = httpx.post(
+        f"{url}{_ADVANCE_PATH}",
+        json={"deltaMs": _advance_delta_ms()},
+        timeout=_TIMESERVER_TIMEOUT_SEC,
+    )
+    resp.raise_for_status()
 
 
 async def aadvance_clock() -> None:
     """Async variant of :func:`advance_clock`."""
-    url = _timeserver_url()
-    if not url:
+    if not _enabled():
         return
-    try:
-        async with httpx.AsyncClient(timeout=_TIMESERVER_TIMEOUT_SEC) as client:
-            await client.post(
-                f"{url}{_ADVANCE_PATH}", json={"deltaMs": _advance_delta_ms()}
-            )
-    except Exception as e:
-        logger.warning(f"dojo time-server {_ADVANCE_PATH} failed: {e}")
+    url = _timeserver_url()
+    async with httpx.AsyncClient(timeout=_TIMESERVER_TIMEOUT_SEC) as client:
+        resp = await client.post(
+            f"{url}{_ADVANCE_PATH}", json={"deltaMs": _advance_delta_ms()}
+        )
+    resp.raise_for_status()

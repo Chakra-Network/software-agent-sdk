@@ -3,6 +3,9 @@
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
+import httpx
+import pytest
+
 from openhands.sdk.utils import dojo_time
 
 
@@ -34,12 +37,11 @@ def test_flag_is_the_gate_not_the_url():
             mock_get.assert_not_called()
 
 
-def test_fake_now_none_when_enabled_but_url_missing():
-    """Flag set but no URL => no-op (best-effort), never raises."""
+def test_fake_now_raises_when_enabled_but_url_missing():
+    """Flag set but no URL is a misconfiguration => raise, don't silently disable."""
     with patch.dict("os.environ", {dojo_time._ENABLED_ENV: "1"}, clear=True):
-        with patch.object(dojo_time.httpx, "get") as mock_get:
-            assert dojo_time.fake_now() is None
-            mock_get.assert_not_called()
+        with pytest.raises(RuntimeError):
+            dojo_time.fake_now()
 
 
 def test_now_isoformat_falls_back_to_real_clock_when_inactive():
@@ -75,17 +77,31 @@ def test_fake_now_reads_live_every_call():
             assert mock_get.call_count == 2
 
 
-def test_fake_now_best_effort_on_failure():
-    """A time-server error returns None (caller falls back), never raises."""
+def test_fake_now_raises_on_timeserver_error():
+    """A time-server error propagates while active — no silent fallback."""
     with patch.dict("os.environ", _ACTIVE_ENV):
-        with patch.object(dojo_time.httpx, "get", side_effect=Exception("boom")):
-            assert dojo_time.fake_now() is None
+        with patch.object(
+            dojo_time.httpx, "get", side_effect=httpx.ConnectError("boom")
+        ):
+            with pytest.raises(httpx.ConnectError):
+                dojo_time.fake_now()
 
 
-def test_fake_now_rejects_nonpositive_nowms():
+def test_fake_now_raises_on_nonpositive_nowms():
     with patch.dict("os.environ", _ACTIVE_ENV):
         with patch.object(dojo_time.httpx, "get", return_value=_state_response(0)):
-            assert dojo_time.fake_now() is None
+            with pytest.raises(ValueError):
+                dojo_time.fake_now()
+
+
+def test_now_isoformat_propagates_active_failure():
+    """The real-clock fallback only covers the inactive case, not a live failure."""
+    with patch.dict("os.environ", _ACTIVE_ENV):
+        with patch.object(
+            dojo_time.httpx, "get", side_effect=httpx.ConnectError("boom")
+        ):
+            with pytest.raises(httpx.ConnectError):
+                dojo_time.now_isoformat()
 
 
 def test_advance_clock_posts_default_delta():
@@ -105,6 +121,15 @@ def test_advance_clock_honors_custom_delta():
         with patch.object(dojo_time.httpx, "post") as mock_post:
             dojo_time.advance_clock()
             assert mock_post.call_args.kwargs["json"] == {"deltaMs": 5000}
+
+
+def test_advance_clock_raises_on_error_status():
+    resp = MagicMock()
+    resp.raise_for_status.side_effect = RuntimeError("bad status")
+    with patch.dict("os.environ", _ACTIVE_ENV):
+        with patch.object(dojo_time.httpx, "post", return_value=resp):
+            with pytest.raises(RuntimeError):
+                dojo_time.advance_clock()
 
 
 def test_advance_clock_inactive_when_flag_unset():
