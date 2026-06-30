@@ -138,6 +138,70 @@ def conversation_service():
 
 
 @pytest.mark.asyncio
+async def test_start_conversation_registers_and_injects_client_tools(
+    conversation_service, tmp_path
+):
+    """client_tools specs are registered, injected into the agent, and persisted.
+
+    Persistence on ``StoredConversation`` is what allows forks and server
+    restarts to re-register the dynamic client tools.
+    """
+    from openhands.sdk.tool.client_tool import ClientToolSpec
+
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+
+    request = StartConversationRequest(
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir=str(workspace_dir)),
+        confirmation_policy=NeverConfirm(),
+        client_tools=[
+            ClientToolSpec(
+                name="srv_show_dialog",
+                description="Show a dialog",
+                parameters={
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+            )
+        ],
+    )
+
+    captured: dict[str, StoredConversation] = {}
+
+    async def fake_start_event_service(stored: StoredConversation):
+        captured["stored"] = stored
+        service = AsyncMock(spec=EventService)
+        service.stored = stored
+        service.get_state.return_value = ConversationState(
+            id=stored.id,
+            agent=stored.agent,
+            workspace=stored.workspace,
+            execution_status=ConversationExecutionStatus.IDLE,
+            confirmation_policy=stored.confirmation_policy,
+        )
+        return service
+
+    with patch.object(
+        conversation_service,
+        "_start_event_service",
+        side_effect=fake_start_event_service,
+    ):
+        await conversation_service.start_conversation(request)
+
+    stored = captured["stored"]
+    # Injected into the agent's tool specs so _initialize() can resolve it
+    assert "srv_show_dialog" in {t.name for t in stored.agent.tools}
+    # Persisted so forks / restarts can re-register the dynamic action type
+    assert [s.name for s in stored.client_tools] == ["srv_show_dialog"]
+    # The class is registered in the global tool registry
+    from openhands.sdk.tool.registry import list_registered_tools
+
+    assert "srv_show_dialog" in list_registered_tools()
+
+
+@pytest.mark.asyncio
 async def test_start_conversation_decrypts_encrypted_agent_settings_mcp_env(
     conversation_service, tmp_path
 ):
@@ -2540,7 +2604,9 @@ class TestAutoTitle:
         mock_llm = LLM(model="gpt-3.5-turbo", usage_id="title-llm")
 
         with (
-            patch("openhands.sdk.llm.llm_profile_store.LLMProfileStore") as MockStore,
+            patch(
+                "openhands.agent_server.persistence.store.get_llm_profile_store"
+            ) as MockStore,
             patch(
                 self._GENERATE_TITLE_PATH, return_value="✨ Profile LLM Title"
             ) as mock_generate_title,
@@ -2570,7 +2636,9 @@ class TestAutoTitle:
         agent_llm = service._conversation.agent.llm
 
         with (
-            patch("openhands.sdk.llm.llm_profile_store.LLMProfileStore") as MockStore,
+            patch(
+                "openhands.agent_server.persistence.store.get_llm_profile_store"
+            ) as MockStore,
             patch(
                 self._GENERATE_TITLE_PATH, return_value="✨ Agent LLM Title"
             ) as mock_generate_title,
@@ -2618,7 +2686,9 @@ class TestAutoTitle:
         agent_llm = service._conversation.agent.llm
 
         with (
-            patch("openhands.sdk.llm.llm_profile_store.LLMProfileStore") as MockStore,
+            patch(
+                "openhands.agent_server.persistence.store.get_llm_profile_store"
+            ) as MockStore,
             patch(
                 self._GENERATE_TITLE_PATH, return_value="✨ Agent LLM Title"
             ) as mock_generate_title,
@@ -2649,7 +2719,9 @@ class TestAutoTitle:
         service.save_meta.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_autotitle_integration_routes_through_profile_store(self, tmp_path):
+    async def test_autotitle_integration_routes_through_profile_store(
+        self, tmp_path, monkeypatch, request
+    ):
         """End-to-end: profile on disk → LLMProfileStore.load → title LLM call.
 
         Exercises the real wiring from AutoTitleSubscriber through LLMProfileStore
@@ -2707,17 +2779,21 @@ class TestAutoTitle:
                 raw_response=raw,
             )
 
-        # Point LLMProfileStore() (no args) at our tmp dir so the real
-        # _load_title_llm code path finds our on-disk profile.
-        with (
-            patch(
-                "openhands.sdk.llm.llm_profile_store._DEFAULT_PROFILE_DIR", profile_dir
-            ),
-            patch(
-                "openhands.sdk.llm.llm.LLM.completion",
-                autospec=True,
-                side_effect=fake_completion,
-            ),
+        # Point the agent-server profile store singleton at our tmp dir via
+        # OH_PERSISTENCE_DIR so the real _load_title_llm code path finds our
+        # on-disk profile under `{tmp_path}/profiles`.
+        from openhands.agent_server.persistence import reset_stores
+
+        monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path))
+        reset_stores()
+        # Clear the singleton at teardown even if an assertion raises, so the
+        # stale store (pointing at the soon-deleted tmp_path) can't leak.
+        request.addfinalizer(reset_stores)
+
+        with patch(
+            "openhands.sdk.llm.llm.LLM.completion",
+            autospec=True,
+            side_effect=fake_completion,
         ):
             subscriber = AutoTitleSubscriber(service=service)
             await subscriber(self._user_message_event("Fix the login bug"))
@@ -2737,7 +2813,9 @@ class TestAutoTitle:
         service.save_meta.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_autotitle_decrypts_cipher_encrypted_title_profile(self, tmp_path):
+    async def test_autotitle_decrypts_cipher_encrypted_title_profile(
+        self, tmp_path, monkeypatch, request
+    ):
         """Regression for #3164: a cipher-encrypted title-LLM profile must be
         decrypted on load so the title LLM sees the plaintext API key, not
         Fernet ciphertext.
@@ -2798,15 +2876,18 @@ class TestAutoTitle:
                 raw_response=raw,
             )
 
-        with (
-            patch(
-                "openhands.sdk.llm.llm_profile_store._DEFAULT_PROFILE_DIR", profile_dir
-            ),
-            patch(
-                "openhands.sdk.llm.llm.LLM.completion",
-                autospec=True,
-                side_effect=fake_completion,
-            ),
+        from openhands.agent_server.persistence import reset_stores
+
+        monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path))
+        reset_stores()
+        # Clear the singleton at teardown even if an assertion raises, so the
+        # stale store (pointing at the soon-deleted tmp_path) can't leak.
+        request.addfinalizer(reset_stores)
+
+        with patch(
+            "openhands.sdk.llm.llm.LLM.completion",
+            autospec=True,
+            side_effect=fake_completion,
         ):
             subscriber = AutoTitleSubscriber(service=service)
             await subscriber(self._user_message_event("Fix the login bug"))

@@ -5,6 +5,10 @@ import subprocess
 from pathlib import Path
 
 from openhands.sdk.git.exceptions import GitCommandError, GitRepositoryError
+from openhands.sdk.utils.redact import (
+    redact_url_credentials,
+    redact_url_credentials_in_text,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -32,6 +36,9 @@ def run_git_command(
     Raises:
         GitCommandError: If the git command fails
     """
+    redacted_args = [redact_url_credentials(a) for a in args]
+    cmd_str = shlex.join(redacted_args)
+
     try:
         result = subprocess.run(
             args,
@@ -43,28 +50,30 @@ def run_git_command(
         )
 
         if result.returncode != 0:
-            cmd_str = shlex.join(args)
             error_msg = f"Git command failed: {cmd_str}"
+            # stderr can echo the remote URL (with embedded credentials on some
+            # git versions / error paths), so redact before logging and storing.
+            redacted_stderr = redact_url_credentials_in_text(result.stderr)
             logger.error(
-                f"{error_msg}. Exit code: {result.returncode}. Stderr: {result.stderr}"
+                f"{error_msg}. Exit code: {result.returncode}. "
+                f"Stderr: {redacted_stderr}"
             )
             raise GitCommandError(
                 message=error_msg,
-                command=args,
+                command=redacted_args,
                 exit_code=result.returncode,
-                stderr=result.stderr.strip(),
+                stderr=redacted_stderr.strip(),
             )
 
-        logger.debug(f"Git command succeeded: {shlex.join(args)}")
+        logger.debug(f"Git command succeeded: {cmd_str}")
         return result.stdout.strip()
 
     except subprocess.TimeoutExpired as e:
-        cmd_str = shlex.join(args)
         error_msg = f"Git command timed out: {cmd_str}"
         logger.error(error_msg)
         raise GitCommandError(
             message=error_msg,
-            command=args,
+            command=redacted_args,
             exit_code=-1,
             stderr="Command timed out",
         ) from e
@@ -73,7 +82,7 @@ def run_git_command(
         logger.error(error_msg)
         raise GitCommandError(
             message=error_msg,
-            command=args,
+            command=redacted_args,
             exit_code=-1,
             stderr="Git executable not found",
         ) from e
@@ -262,14 +271,10 @@ def validate_git_repository(repo_dir: str | Path) -> Path:
     if not repo_path.is_dir():
         raise GitRepositoryError(f"Path is not a directory: {repo_path}")
 
-    # Check if it's a git repository by looking for .git directory or file
-    git_dir = repo_path / ".git"
-    if not git_dir.exists():
-        # Maybe we're in a subdirectory, try to find the git root
-        try:
-            run_git_command(["git", "rev-parse", "--git-dir"], repo_path)
-        except GitCommandError as e:
-            raise GitRepositoryError(f"Not a git repository: {repo_path}") from e
+    try:
+        run_git_command(["git", "rev-parse", "--git-dir"], repo_path)
+    except GitCommandError as e:
+        raise GitRepositoryError(f"Not a git repository: {repo_path}") from e
 
     return repo_path
 

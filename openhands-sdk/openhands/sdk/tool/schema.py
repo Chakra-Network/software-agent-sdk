@@ -12,7 +12,7 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.utils.models import (
     DiscriminatedUnionMixin,
 )
-from openhands.sdk.utils.visualize import display_dict
+from openhands.sdk.utils.visualize import display_json
 
 
 if TYPE_CHECKING:
@@ -354,7 +354,7 @@ class Action(Schema, ABC):
         # Display all action fields systematically
         content.append("Arguments:", style="bold")
         action_fields = self.model_dump()
-        content.append(display_dict(action_fields))
+        content.append(display_json(action_fields))
 
         return content
 

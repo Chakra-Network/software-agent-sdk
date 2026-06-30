@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, Field, field_validator
 
 from openhands.sdk import LLM
+from openhands.sdk.agent.acp_models import ACPModelInfo
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.conversation.conversation_stats import ConversationStats
 from openhands.sdk.conversation.request import (  # re-export for backward compat
@@ -27,12 +28,16 @@ from openhands.sdk.llm.message import (  # re-export
     TextContent as TextContent,
 )
 from openhands.sdk.llm.utils.metrics import MetricsSnapshot
+from openhands.sdk.profiles.agent_profile import (
+    LaunchedAgentProfile as LaunchedAgentProfile,
+)
 from openhands.sdk.secret import SecretSource
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import (
     ConfirmationPolicyBase,
     NeverConfirm,
 )
+from openhands.sdk.tool.client_tool import ClientToolSpec
 from openhands.sdk.utils import OpenHandsUUID, utc_now
 from openhands.sdk.utils.models import (
     DiscriminatedUnionMixin,
@@ -76,6 +81,10 @@ class StoredConversation(StartConversationRequest):
     Extends StartConversationRequest with server-assigned fields.
     """
 
+    # agent_profile_id is resolved into launched_agent_profile at creation; exclude from
+    # the persistence payload so it does not re-appear in meta.json.
+    agent_profile_id: UUID | None = Field(default=None, exclude=True)
+
     id: OpenHandsUUID
     title: str | None = Field(
         default=None, description="User-defined title for the conversation"
@@ -83,6 +92,15 @@ class StoredConversation(StartConversationRequest):
     metrics: MetricsSnapshot | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+    launched_agent_profile: LaunchedAgentProfile | None = Field(
+        default=None,
+        description=(
+            "Provenance snapshot of the agent profile that launched this "
+            "conversation. Set at creation when `agent_profile_id` is supplied; "
+            "``None`` for conversations started directly with `agent` or "
+            "`agent_settings`."
+        ),
+    )
 
 
 class _ConversationInfoBase(BaseModel):
@@ -184,6 +202,64 @@ class _ConversationInfoBase(BaseModel):
             "alphanumeric. Values are arbitrary strings up to 256 characters."
         ),
     )
+    current_model_id: str | None = Field(
+        default=None,
+        description=(
+            "Model the agent is actually using for this session. For ACP "
+            "agents, this is lifted off ``ACPAgent.current_model_id`` "
+            "(populated from the ``models.currentModelId`` field on the "
+            "ACP session response, or from ``acp_model`` when the caller "
+            "forced an override). May be an opaque alias (e.g. "
+            'claude-agent-acp\'s ``"default"``); match it against '
+            "``available_models`` to get a display label. ``None`` for older "
+            "ACP servers that don't surface the field, or while the agent is "
+            "still initializing. Native OpenHands agents leave this ``None`` — "
+            "consumers should read ``agent.llm.model`` for those."
+        ),
+    )
+    available_models: list[ACPModelInfo] = Field(
+        default_factory=list,
+        description=(
+            "Models the ACP server offers for this session, lifted off "
+            "``ACPAgent.available_models`` (the ``models.availableModels`` "
+            "field on the ACP session response). Each entry carries a "
+            "``model_id`` plus an optional ``name``/``description``. Surfaced "
+            "verbatim so clients can render a model picker and resolve "
+            "``current_model_id`` to a display label themselves — the server "
+            "does no name curation. Empty for ACP servers that don't surface "
+            "the (UNSTABLE) capability and for native OpenHands agents. "
+            "Client contract: ``current_model_id`` is NOT guaranteed to be a "
+            "member — a forced ``acp_model`` override may name a model absent "
+            "from the list — so treat a miss as 'show the raw id'. Some "
+            "entries are opaque aliases whose human identity lives in "
+            '``description`` (e.g. claude-agent-acp\'s ``"default"`` -> '
+            '``"Opus 4.7 with 1M context · ..."``).'
+        ),
+    )
+    supports_runtime_model_switch: bool = Field(
+        default=False,
+        description=(
+            "Whether a live, mid-conversation model switch will be attempted "
+            "for this conversation — "
+            "tells the inline picker whether to offer a live-switch control. "
+            "Mirrors the SDK's switch gate: ``True`` for known switch-capable "
+            "providers; ``False`` for unknown/custom ACP servers because their "
+            "generic config writes are not guaranteed live-switch primitives. "
+            "``False`` for native "
+            "OpenHands agents, for a known provider that declares no support, "
+            "and before the conversation has started a session."
+        ),
+    )
+    launched_agent_profile: LaunchedAgentProfile | None = Field(
+        default=None,
+        description=(
+            "Provenance snapshot of the agent profile that launched this "
+            "conversation. Set at creation when the conversation was started via "
+            "``agent_profile_id``; ``None`` for conversations started directly "
+            "with ``agent`` or ``agent_settings``. Clients use this to identify "
+            "which agent profile is current without fragile settings-comparison."
+        ),
+    )
 
 
 class ConversationInfo(_ConversationInfoBase):
@@ -192,6 +268,15 @@ class ConversationInfo(_ConversationInfoBase):
     agent: AgentBase = Field(
         ...,
         description="The agent running in the conversation.",
+    )
+    client_tools: list[ClientToolSpec] = Field(
+        default_factory=list,
+        description=(
+            "Client-defined tool specs registered for this conversation. "
+            "Surfaced so that a client re-attaching by conversation id can "
+            "register the dynamic ClientAction_* action types before syncing "
+            "persisted events, avoiding 'Unknown kind' deserialization errors."
+        ),
     )
 
 
@@ -412,6 +497,15 @@ class AskAgentResponse(BaseModel):
     """Response containing the agent's answer."""
 
     response: str = Field(description="The agent's response to the question")
+
+
+class StartGoalRequest(BaseModel):
+    """Payload to start a ``/goal`` loop inside a conversation."""
+
+    objective: str = Field(description="The goal objective to pursue and audit.")
+    max_iterations: int = Field(
+        default=10, ge=1, description="Maximum audit rounds before giving up."
+    )
 
 
 class AgentResponseResult(BaseModel):
