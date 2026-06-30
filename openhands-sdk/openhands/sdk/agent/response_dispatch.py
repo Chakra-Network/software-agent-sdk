@@ -287,9 +287,29 @@ class ResponseDispatchMixin:
         state: ConversationState,
         on_event: ConversationCallbackType,
     ) -> None:
-        """Handle LLM response with text content — finishes conversation."""
+        """Handle LLM response with text content.
+
+        Normally a text-only turn finishes the conversation. BACKSTOP: gemini
+        via OpenRouter intermittently hits MALFORMED_FUNCTION_CALL, which
+        OpenRouter remaps to a normal "stop" and leaks a scrap of the botched
+        call as content (e.g. "5", "}", "000Z"). That junk turn is otherwise
+        misread as a deliberate final answer and ends the run. If the only
+        content is an implausibly-short fragment with no tool call, treat it as
+        a fumbled tool call and nudge for a tool call instead of finishing.
+        """
+        visible = "".join(
+            c.text for c in message.content if isinstance(c, TextContent)
+        ).strip()
         self._emit_message_event(message, llm_response, conversation, on_event)
         self._maybe_emit_vllm_tokens(llm_response, on_event)
+        if len(visible) <= 12 and "\n" not in visible:
+            logger.warning(
+                "Suspected malformed-function-call leak as content %r - "
+                "nudging for a tool call instead of finishing",
+                visible,
+            )
+            self._send_corrective_nudge(on_event)
+            return
         logger.debug("LLM produced a message response - awaits user input")
         state.execution_status = ConversationExecutionStatus.FINISHED
 
