@@ -123,4 +123,10 @@ def select_chat_options(
             "x-litellm-session-id": ctx.session_id,
         }
 
+    # Gemini uses reasoning_effort -> thinking_level; strip any Anthropic-style
+    # `thinking` budget from ANY source (defaults, user_kwargs, runtime injection
+    # by the runner) so litellm never sees both thinking and thinking_level.
+    if "gemini" in llm.model.lower():
+        out.pop("thinking", None)
+
     return out
