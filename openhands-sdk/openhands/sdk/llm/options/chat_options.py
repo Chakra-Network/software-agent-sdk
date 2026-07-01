@@ -62,7 +62,14 @@ def select_chat_options(
             out.pop("top_p", None)
 
     # Extended thinking models
-    if get_features(llm.model).supports_extended_thinking:
+    # NOTE: Gemini 3 uses reasoning_effort (litellm -> thinking_level). It must NOT
+    # also receive an Anthropic-style `thinking` budget, or litellm raises
+    # UnsupportedParamsError ("Cannot specify both thinking and thinking_level").
+    # Skip the extended-thinking budget for Gemini; reasoning stays on via thinking_level.
+    if (
+        get_features(llm.model).supports_extended_thinking
+        and "gemini" not in llm.model.lower()
+    ):
         if llm.extended_thinking_budget and max_output_tokens:
             # Anthropic throws errors if thinking budget equals or exceeds max output
             # tokens -- force the thinking budget lower if there's a conflict
