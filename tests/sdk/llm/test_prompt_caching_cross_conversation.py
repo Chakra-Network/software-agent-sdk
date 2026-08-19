@@ -11,7 +11,7 @@ import pytest
 from pydantic import SecretStr
 
 from openhands.sdk import LLM, Agent, AgentContext
-from openhands.sdk.llm import Message, TextContent
+from openhands.sdk.llm import ImageContent, Message, TextContent
 from openhands.sdk.skills import Skill
 
 
@@ -264,3 +264,54 @@ def test_cross_conversation_cache_sharing(tmp_path, first_suffix, second_suffix)
 
     assert static_prompts[0] == static_prompts[1]
     assert dynamic_contexts[0] != dynamic_contexts[1]
+
+
+def test_stable_anchor_breakpoint_behind_pruned_images():
+    """A multimodal conversation with pruned image history keeps a STABLE cache
+    anchor behind the image region.
+
+    When image history is pruned to the newest screenshot, the last user/tool
+    message carries the image and its content is rewritten every turn, so the tail
+    breakpoint alone collapses caching to system+tools on long runs. The anchor
+    breakpoint must land on the newest image-FREE user/tool message (the settled
+    region) so a durable cache write survives across turns.
+    """
+    llm = LLM(
+        model="claude-sonnet-4-20250514",
+        api_key=SecretStr("fake-key"),
+        usage_id="test",
+        caching_prompt=True,
+    )
+
+    messages = [
+        Message(role="system", content=[TextContent(text="Static system prompt")]),
+        Message(role="user", content=[TextContent(text="Do the task")]),
+        Message(role="assistant", content=[TextContent(text="step 1")]),
+        # Older observation: its screenshot was already pruned -> text only (settled).
+        Message(role="tool", content=[TextContent(text="[tool executed]")]),
+        Message(role="assistant", content=[TextContent(text="step 2")]),
+        # Newest observation: still carries its screenshot.
+        Message(
+            role="tool",
+            content=[
+                TextContent(text="[tool executed]"),
+                ImageContent(image_urls=["data:image/jpeg;base64,abc"]),
+            ],
+        ),
+    ]
+
+    llm._apply_prompt_caching(messages)
+
+    # System static block is marked.
+    assert messages[0].content[0].cache_prompt is True
+    # Tail: last user/tool message (the image-bearing observation), on its last block.
+    assert messages[-1].content[-1].cache_prompt is True
+    # Anchor: the newest image-free user/tool message (the settled tool observation).
+    settled_tool = messages[3]
+    assert settled_tool.contains_image is False
+    assert settled_tool.content[-1].cache_prompt is True
+    # Exactly three breakpoints: system + anchor + tail (within Anthropic's limit of 4).
+    marked = sum(
+        1 for m in messages for c in m.content if getattr(c, "cache_prompt", False)
+    )
+    assert marked == 3
