@@ -2642,6 +2642,10 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
            If there are two blocks (static + dynamic), only the first is marked
            to enable cross-conversation cache sharing.
         2. Last user/tool message: Mark for caching to extend the cache prefix.
+        3. Newest user/tool message with no image: a STABLE anchor behind any
+           pruned-image region, so caching survives on long multimodal runs
+           (see the comment on the loop below). Anthropic allows 4 breakpoints;
+           this uses at most 3 (system + anchor + tail).
         """
         if len(messages) > 0 and messages[0].role == "system":
             sys_content = messages[0].content
@@ -2654,14 +2658,35 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 # Single block: mark it for caching
                 sys_content[0].cache_prompt = True
 
-        # Second breakpoint: mark the last user/tool message so the cached prefix
-        # extends every turn. Anthropic-only; Gemini is excluded from
-        # PROMPT_CACHE_MODELS because its cache can't extend this way.
+        # Breakpoints 2 and 3. The TAIL breakpoint marks the last user/tool message
+        # so the cached prefix extends every turn. On its own that is fragile for
+        # multimodal agents that prune image history: when only the newest screenshot
+        # is kept, the previous turn's image is stripped from history on the next turn,
+        # which mutates the prefix of the cache entry just written at the tail. Anthropic
+        # writes a cache entry only at a breakpoint and, on a miss, walks back a limited
+        # window looking for an entry a prior request actually wrote; since every prior
+        # tail write's prefix contained an image that is now gone, none match and it
+        # falls back to the system breakpoint -- collapsing the cache to system+tools on
+        # long conversations. To keep a durable anchor, we ALSO mark the newest user/tool
+        # message that contains no image: that region of the history is settled and will
+        # not mutate again, so its cache write survives across turns and the walk-back can
+        # reuse it. For text-only conversations this simply adds one extra stable
+        # breakpoint (never harmful, within the 4-breakpoint limit). Anthropic-only;
+        # Gemini is excluded from PROMPT_CACHE_MODELS because its cache can't extend.
+        tail_marked = False
+        anchor_marked = False
         for message in reversed(messages):
-            if message.role in ("user", "tool"):
-                message.content[
-                    -1
-                ].cache_prompt = True  # Last item inside the message content
+            if message.role not in ("user", "tool") or not message.content:
+                continue
+            if not tail_marked:
+                # Tail: last item of the last user/tool message.
+                message.content[-1].cache_prompt = True
+                tail_marked = True
+                continue
+            if not anchor_marked and not message.contains_image:
+                # Anchor: newest image-free user/tool message (settled prefix).
+                message.content[-1].cache_prompt = True
+                anchor_marked = True
                 break
 
     def _inline_required(self) -> bool:
